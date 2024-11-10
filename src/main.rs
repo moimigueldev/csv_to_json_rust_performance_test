@@ -1,4 +1,4 @@
-use std::{fs::File, io::BufWriter};
+use std::{collections::HashMap, fs::File, io::BufWriter};
 
 use serde_json::{json, to_writer, Value};
 use std::io::Write;
@@ -28,13 +28,10 @@ fn main() {
             .map(|l| l.to_string())
             .collect::<Vec<_>>();
 
-        let mut json_object = json!({});
-
-        for (j, h) in headers.iter().enumerate() {
-            let map = json_object.as_object_mut().expect("Expected a jons object");
-
-            map.insert(h.to_string(), Value::String(readable_line[j].to_string()));
-        }
+        let json_object = json!(headers
+            .iter()
+            .zip(readable_line.iter())
+            .collect::<HashMap<_, _>>());
 
         if i > 0 {
             write!(writer, ",").expect("Unable to write comma");
