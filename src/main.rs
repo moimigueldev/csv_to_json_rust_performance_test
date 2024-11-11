@@ -1,8 +1,10 @@
 use std::{
     fs::File,
     io::{BufWriter, Write},
+    thread,
 };
 
+use crossbeam_channel::bounded;
 use rayon::prelude::*;
 use serde_json::{json, to_writer, Value};
 
@@ -17,6 +19,12 @@ fn main() {
         .parse()
         .unwrap_or(100);
 
+    let bounded_size = std::env::args()
+        .nth(2)
+        .unwrap_or("5".to_string())
+        .parse()
+        .unwrap_or(5);
+
     let output_file = File::create("./output.json").expect("Unable to create");
     let mut reader = csv::Reader::from_path(file_path).expect("Error while reading file");
     let headers: Vec<String> = reader
@@ -25,47 +33,53 @@ fn main() {
         .iter()
         .map(|h| h.to_string())
         .collect();
-    let mut writer = BufWriter::new(&output_file);
-    let records: Vec<_> = reader
-        .records()
-        .collect::<Result<_, _>>()
-        .expect("Failed to read records");
 
-    let batches: Vec<_> = records
-        .par_chunks(batch_size)
-        .map(|chunk| {
-            let mut batch = Vec::new();
+    let (sender, receiver) = bounded(bounded_size);
 
-            for line in chunk {
-                let mut json_object = json!({});
-                for (index, header) in headers.iter().enumerate() {
-                    let map = json_object.as_object_mut().expect("Expected a jons object");
-                    map.insert(
-                        header.to_string(),
-                        Value::String(line.get(index).unwrap().to_string()),
-                    );
-                }
+    let writer_thread = thread::spawn(move || {
+        let mut writer = BufWriter::new(&output_file);
 
-                batch.push(json_object);
+        write!(writer, "[").expect("Unable to write closing bracket");
+
+        let mut first = true;
+
+        for batch in receiver {
+            if !first {
+                write!(writer, ",").expect("unable to write comma");
+                first = false;
             }
 
-            batch
-        })
-        .collect();
-
-    let mut first_batch = true;
-
-    write!(writer, "[").expect("Unable to write closing bracket");
-    for batch in batches {
-        for json_obect in batch {
-            if !first_batch {}
-            write!(&mut writer, ",").expect("Unable to write comma");
-            first_batch = false;
-            to_writer(&mut writer, &json_obect).expect("Unable to write final batch to file");
+            to_writer(&mut writer, &batch).expect("Unable to write batch to file");
         }
-    }
 
-    write!(writer, "]").expect("Unable to write closing bracket");
+        write!(writer, "]").expect("Unable to write closing bracket");
+    });
 
-    // to_writer(&mut writer, &json_list).expect("Unable to write final batch to file");
+    let records = reader
+        .records()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("Failed to read records");
+
+    records
+        .par_chunks(batch_size)
+        .for_each_with(sender, |s, chunk| {
+            let batch: Vec<Value> = chunk
+                .iter()
+                .map(|record| {
+                    let mut json_object = json!({});
+                    for (index, header) in headers.iter().enumerate() {
+                        json_object.as_object_mut().unwrap().insert(
+                            header.clone(),
+                            Value::String(record.get(index).unwrap().to_string()),
+                        );
+                    }
+
+                    json_object
+                })
+                .collect();
+
+            s.send(batch).expect("Failed to send batch");
+        });
+
+    writer_thread.join().expect("Writer thread panicked")
 }
