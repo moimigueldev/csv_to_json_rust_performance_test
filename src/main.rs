@@ -1,10 +1,8 @@
 use std::{
-    fs::File,
-    io::{BufWriter, Write},
-    thread,
+    fs::{self, File},
+    io::{BufReader, BufWriter, Read, Write},
 };
 
-use crossbeam_channel::bounded;
 use rayon::prelude::*;
 use serde_json::{json, to_writer, Value};
 
@@ -19,13 +17,12 @@ fn main() {
         .parse()
         .unwrap_or(100);
 
-    let bounded_size = std::env::args()
-        .nth(2)
-        .unwrap_or("5".to_string())
-        .parse()
-        .unwrap_or(5);
+    std::fs::create_dir_all("./batch_files").expect("Failed to create directory");
 
     let output_file = File::create("./output.json").expect("Unable to create");
+    let mut output_writer = BufWriter::new(output_file);
+    write!(output_writer, "[").expect("Unable to write opening bracket"); // Write the opening bracket for JSON array
+
     let mut reader = csv::Reader::from_path(file_path).expect("Error while reading file");
     let headers: Vec<String> = reader
         .headers()
@@ -34,52 +31,60 @@ fn main() {
         .map(|h| h.to_string())
         .collect();
 
-    let (sender, receiver) = bounded(bounded_size);
-
-    let writer_thread = thread::spawn(move || {
-        let mut writer = BufWriter::new(&output_file);
-
-        write!(writer, "[").expect("Unable to write closing bracket");
-
-        let mut first = true;
-
-        for batch in receiver {
-            if !first {
-                write!(writer, ",").expect("unable to write comma");
-                first = false;
-            }
-
-            to_writer(&mut writer, &batch).expect("Unable to write batch to file");
-        }
-
-        write!(writer, "]").expect("Unable to write closing bracket");
-    });
-
-    let records = reader
+    reader
         .records()
         .collect::<Result<Vec<_>, _>>()
-        .expect("Failed to read records");
-
-    records
+        .expect("Failed to read records")
         .par_chunks(batch_size)
-        .for_each_with(sender, |s, chunk| {
-            let batch: Vec<Value> = chunk
-                .iter()
-                .map(|record| {
-                    let mut json_object = json!({});
-                    for (index, header) in headers.iter().enumerate() {
-                        json_object.as_object_mut().unwrap().insert(
-                            header.clone(),
-                            Value::String(record.get(index).unwrap().to_string()),
-                        );
-                    }
+        .enumerate()
+        .for_each(|(i, chunk)| {
+            let batch_file_name = format!("./batch_files/output-{}.json", i);
+            let batch_file = File::create(&batch_file_name).expect("Unable to create batch file");
+            let mut writer = BufWriter::new(batch_file);
 
-                    json_object
-                })
-                .collect();
+            for (index, line) in chunk.iter().enumerate() {
+                let mut json_object = json!({});
+                for (j, header) in headers.iter().enumerate() {
+                    json_object.as_object_mut().unwrap().insert(
+                        header.clone(),
+                        Value::String(line.get(j).unwrap().to_string()),
+                    );
+                }
 
-            s.send(batch).expect("Failed to send batch");
+                if index > 0 {
+                    write!(writer, ",").expect("Failed to write comma");
+                }
+
+                to_writer(&mut writer, &json_object).expect("Could not write to file");
+            }
         });
 
-    writer_thread.join().expect("Writer thread panicked")
+    let mut first_file = true;
+
+    for entry in fs::read_dir("./batch_files").expect("./batch_files dir not found") {
+        let entry = entry.expect("Failed to read entry");
+        let path = entry.path();
+
+        if path.is_file() {
+            if !first_file {
+                write!(output_writer, ",").expect("Unable to write comma");
+            } else {
+                first_file = false;
+            }
+
+            let batch_file = File::open(&path).expect("Failed to open batch file");
+            let mut batch_reader = BufReader::new(batch_file);
+
+            let mut content = String::new();
+            batch_reader
+                .read_to_string(&mut content)
+                .expect("Failed to read batch file");
+
+            write!(output_writer, "{}", content).expect("Failed to write batch content to output");
+        }
+    }
+
+    write!(output_writer, "]").expect("Unable to write closing bracket");
+
+    fs::remove_dir_all("./batch_files").expect("Failed to delete batch files directory");
 }
